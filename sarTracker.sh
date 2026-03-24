@@ -62,11 +62,11 @@ lx_ximg "E${examNumber}SallI1"
 # Initialize the CSV file with headers if the flag was used
 if [ "$export_csv" = true ]; then
     csv_file="exam_${examNumber}_summary.csv"
-    echo "Series,Description,SAR,Time(us),Time(M:S),SAR*Mins" > "$csv_file"
+    echo "Series,Time,Description,SAR,Time(us),Time(M:S),SAR*Mins" > "$csv_file"
 fi
 
-# Print the terminal table header
-printf "\n%-10s | %-30s | %-8s | %-13s | %-10s | %-15s\n" "Series" "Description" "SAR" "Time(us)" "Time(M:S)" "SAR*Mins"
+# Print the terminal table header (Series changed to %-6s)
+printf "\n%-6s | %-5s | %-30s | %-8s | %-13s | %-10s | %-15s\n" "Series" "Time" "Description" "SAR" "Time(us)" "Time(M:S)" "SAR*Mins"
 printf "%s\n" "--------------------------------------------------------------------------------------------------"
 
 # Initialize variables for totals
@@ -110,8 +110,16 @@ for file in $sorted_files; do
         fi
     fi
 
-    # b. Image duration (Tag 0019,105a)
-    # Allows integers, decimals, and scientific notation (e.g., e+08)
+    # b. Clock Time (Tag 0008,0031)
+    # Extracts the string, removes brackets, and slices the HHMM string into HH:MM
+    time_raw=$(dcmdump "$file" | grep -i "0008,0031" | head -n 1 | awk -F'#' '{print $1}' | awk '{print $NF}' | tr -d '[]')
+    if [[ ${#time_raw} -ge 4 ]]; then
+        clock_time="${time_raw:0:2}:${time_raw:2:2}"
+    else
+        clock_time="N/A"
+    fi
+
+    # c. Image duration (Tag 0019,105a)
     duration_us=$(dcmdump "$file" | grep -i "0019,105a" | head -n 1 | awk -F'#' '{print $1}' | grep -o -iE '[0-9]*\.?[0-9]+(e[-+]?[0-9]+)?' | tail -n 1)
     [ -z "$duration_us" ] && duration_us=0
 
@@ -123,7 +131,7 @@ for file in $sorted_files; do
     dur_remainder_secs=$(awk -v sec="$dur_sec" -v min="$dur_mins" 'BEGIN { printf "%02.0f", sec - (min * 60) }')
     time_str="${dur_mins}:${dur_remainder_secs}"
 
-    # c. SAR Values (Tag 0018,1316)
+    # d. SAR Values (Tag 0018,1316)
     sar=$(dcmdump "$file" | grep -i "0018,1316" | head -n 1 | awk -F'#' '{print $1}' | grep -o -iE '[0-9]*\.?[0-9]+(e[-+]?[0-9]+)?' | tail -n 1)
     [ -z "$sar" ] && sar=0
 
@@ -134,12 +142,12 @@ for file in $sorted_files; do
     total_time_sec=$(awk -v total="$total_time_sec" -v sec="$dur_sec" 'BEGIN { printf "%.2f", total + sec }')
     total_sar_time=$(awk -v total="$total_sar_time" -v prod="$sar_time_prod" 'BEGIN { printf "%.4f", total + prod }')
 
-    # 3. Display the row in the terminal
-    printf "%-10s | %-30s | %-8.4f | %-13s | %-10s | %-15.4f\n" "$series" "${desc:0:30}" "$sar" "$duration_us" "$time_str" "$sar_time_prod"
+    # 3. Display the row in the terminal (Series changed to %-6s)
+    printf "%-6s | %-5s | %-30s | %-8.4f | %-13s | %-10s | %-15.4f\n" "$series" "$clock_time" "${desc:0:30}" "$sar" "$duration_us" "$time_str" "$sar_time_prod"
 
     # Export the row to the CSV file if the flag was used
     if [ "$export_csv" = true ]; then
-        echo "${series},\"${desc}\",${sar},${duration_us},${time_str},${sar_time_prod}" >> "$csv_file"
+        echo "${series},${clock_time},\"${desc}\",${sar},${duration_us},${time_str},${sar_time_prod}" >> "$csv_file"
     fi
 
 done
@@ -152,12 +160,12 @@ total_mins=$(awk -v sec="$total_time_sec" 'BEGIN { printf "%d", sec / 60 }')
 total_remainder_secs=$(awk -v sec="$total_time_sec" -v min="$total_mins" 'BEGIN { printf "%02.0f", sec - (min * 60) }')
 total_time_str="${total_mins}:${total_remainder_secs}"
 
-# 4. Display the final tally in the terminal
-printf "%-10s   %-30s   %-8s | %-13s | %-10s | %-15.4f\n\n" "TOTALS" "" "" "" "$total_time_str" "$total_sar_time"
+# 4. Display the final tally in the terminal (Series column space changed to %-6s)
+printf "%-6s   %-5s   %-30s   %-8s | %-13s | %-10s | %-15.4f\n\n" "TOTALS" "" "" "" "" "$total_time_str" "$total_sar_time"
 
 # Append the final tally to the CSV file if the flag was used
 if [ "$export_csv" = true ]; then
-    echo "TOTALS,,,,${total_time_str},${total_sar_time}" >> "$csv_file"
+    echo "TOTALS,,,,,${total_time_str},${total_sar_time}" >> "$csv_file"
     echo "Done! Data successfully exported to: $csv_file"
 fi
 
@@ -165,4 +173,3 @@ fi
 echo "Cleaning up temporary DICOM files..."
 rm -f E"${examNumber}"S*I1.MR.dcm
 echo "Cleanup complete."
-
