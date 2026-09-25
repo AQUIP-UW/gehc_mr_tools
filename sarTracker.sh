@@ -4,7 +4,7 @@
 #
 # Samuel A. Hurley
 # University of Wisconsin - Madison
-# 19 March 2026
+# 25 September 2026
 #
 # 0.1 - Initial version
 # 0.2 - implemented --smart-proc
@@ -14,6 +14,12 @@
 # 0.6 - tightened terminal output columns
 # 0.7 - further tightened SAR column and divider lines
 # 1.0 - reordered columns, hid Time(us), and added auto SAR limit detection
+# 1.1 - refactored code for detecting SAR mode
+# 1.2 - removed deprecated tags, updated display names
+# 1.3 - fixed parsing bug caused by dcmdump string truncation
+# 1.4 - replaced awk with cut for bracket parsing to silence warnings
+# 1.5 - added --break-after flag to reset running totals for implant cooldowns
+# 1.6 - replaced lx_ximg dependency with native bash extraction function
 
 # DICOM DICT
 SCRIPTDIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
@@ -27,14 +33,22 @@ smart_proc=false
 examNumber=""
 sar_limit=""
 expect_sar_limit=false
+break_series=()
+expect_break_after=false
 show_help=false
 
 # Parse command line arguments
 for arg in "$@"; do
-    # If the previous argument was --sar-mode, capture this argument as the value
+    # Capture argument values for flags that require them
     if [ "$expect_sar_limit" = true ]; then
         sar_limit="$arg"
         expect_sar_limit=false
+        continue
+    fi
+    if [ "$expect_break_after" = true ]; then
+        IFS=',' read -ra ADDR <<< "$arg"
+        break_series+=("${ADDR[@]}")
+        expect_break_after=false
         continue
     fi
 
@@ -44,7 +58,12 @@ for arg in "$@"; do
         --ignore-proc) ignore_proc=true ;;
         --smart-proc) smart_proc=true ;;
         --sar-mode) expect_sar_limit=true ;;
-        --sar-mode=*) sar_limit="${arg#*=}" ;; # Alternate format catch (e.g. --sar-mode=2.0)
+        --sar-mode=*) sar_limit="${arg#*=}" ;;
+        --break-after) expect_break_after=true ;;
+        --break-after=*) 
+            IFS=',' read -ra ADDR <<< "${arg#*=}"
+            break_series+=("${ADDR[@]}") 
+            ;;
         -h|--help) show_help=true ;;
         -*) 
             echo "Error: Unknown parameter passed: $arg"
@@ -52,7 +71,8 @@ for arg in "$@"; do
             ;;
         *) 
             # If it doesn't start with a dash, assume it's the exam number
-            examNumber="$arg" 
+            # Remove any non-numeric characters (e.g. accidental trailing slashes)
+            examNumber="${arg//[^0-9]/}" 
             ;;
     esac
 done
@@ -70,10 +90,11 @@ if [ "$show_help" = true ] || [ -z "$examNumber" ]; then
     echo "  --ignore-proc     Strictly ignore ALL processed series (Series number >= 100)"
     echo "  --smart-proc      Ignore processed series if base exists. Limits to 2 if base is missing."
     echo "  --sar-mode LIMIT  Override auto-detected SAR limit (W/kg) for effective time calc"
+    echo "  --break-after NUM Specify a series number (or comma-separated list) to reset totals after"
     echo "  -h, --help        Display this help screen and exit"
     echo ""
     echo "Example:"
-    echo "  $(basename "$0") --csv --smart-proc --sar-mode 2.0 12345"
+    echo "  $(basename "$0") --csv --smart-proc --break-after 5,10 12345"
     exit 1
 fi
 
@@ -85,9 +106,96 @@ mkdir -p "$tmp_dir"
 # Ensure the temp directory is ALWAYS deleted when the script exits or is aborted
 trap 'echo "Cleaning up temporary directory..."; rm -rf "$tmp_dir"' EXIT
 
-# 1. Run the command to dump the files into the temporary directory
-echo "Fetching files for exam $examNumber into $tmp_dir..."
-lx_ximg -d "$tmp_dir" "E${examNumber}SallI1" > /dev/null 2>&1
+# --- Helper Functions ---
+
+# Helper function to print the dynamic totals
+print_totals() {
+    local label="$1"
+    
+    # Calculate total time in MM:SS
+    local total_mins=$(awk -v sec="$total_time_sec" 'BEGIN { printf "%d", sec / 60 }')
+    local total_remainder_secs=$(awk -v sec="$total_time_sec" -v min="$total_mins" 'BEGIN { printf "%02.0f", sec - (min * 60) }')
+    local total_time_str="${total_mins}:${total_remainder_secs}"
+
+    # Calculate total effective time in MM:SS (if sar_limit was determined)
+    local total_eff_time_str="N/A"
+    if [ -n "$sar_limit" ]; then
+        local total_eff_mins=$(awk -v sec="$total_eff_time_sec" 'BEGIN { printf "%d", sec / 60 }')
+        local total_eff_remainder_secs=$(awk -v sec="$total_eff_time_sec" -v min="$total_eff_mins" 'BEGIN { printf "%02.0f", sec - (min * 60) }')
+        total_eff_time_str="${total_eff_mins}:${total_eff_remainder_secs}"
+    fi
+
+    # Display the tally in the terminal
+    printf "%-6s   %-5s   %-30s   %-6s | %-8.4f | %-9s | %-8s\n" "$label" "" "" "" "$total_sar_time" "$total_time_str" "$total_eff_time_str"
+
+    # Append to the CSV file if the flag was used
+    if [ "$export_csv" = true ]; then
+        echo "${label},,,,${total_sar_time},,${total_time_str},${total_eff_time_str}" >> "$csv_file"
+    fi
+}
+
+# Helper function to extract Image 1 from all series in a given exam
+extract_images() {
+    local exam_num="$1"
+    local out_dir="$2"
+    local ge_db_dir="/export/home1/sdc_image_pool/images"
+    local exam_found=false
+
+    echo "Searching GE database for exam $exam_num..."
+
+    # 1. Loop through all hpat/exam directories
+    for exam_dir in "$ge_db_dir"/*/*; do
+        [ -d "$exam_dir" ] || continue
+
+        # Grab the first image of the first series to check the Exam Number
+        local first_img=$(ls "$exam_dir"/*/* 2>/dev/null | grep -iE 'i[0-9]+\.mrdc\.[0-9]+' | head -n 1)
+        [ -z "$first_img" ] && continue
+
+        # Extract (0020,0010) Study ID (Exam Number)
+        local current_exam=$(dcmdump "$first_img" 2>/dev/null | grep -i "0020,0010" | awk -F'[' '{print $2}' | cut -d']' -f1 | tr -d ' ')
+
+        if [ "$current_exam" == "$exam_num" ]; then
+            exam_found=true
+            echo "Dumping files for exam $exam_num into $out_dir..."
+            
+            # 2. Loop through all series directories inside this exam
+            for series_dir in "$exam_dir"/*; do
+                [ -d "$series_dir" ] || continue
+                
+                # Get the Series Number (0020,0011)
+                local series_img=$(ls "$series_dir"/* 2>/dev/null | grep -iE 'i[0-9]+\.mrdc\.[0-9]+' | head -n 1)
+                [ -z "$series_img" ] && continue
+                local series_num=$(dcmdump "$series_img" 2>/dev/null | grep -i "0020,0011" | awk -F'[' '{print $2}' | cut -d']' -f1 | tr -d ' ')
+                
+                # 3. Find Image 1 in this series using GE's filename extension
+                for img_file in "$series_dir"/i*.MRDC.*; do
+                    [ -e "$img_file" ] || continue
+                    local img_num="${img_file##*.MRDC.}" # Bash string manipulation to extract number after .MRDC.
+                    
+                    if [ "$img_num" == "1" ]; then
+                        # Copy and rename to perfectly match the old lx_ximg output format
+                        cp "$img_file" "$out_dir/E${exam_num}S${series_num}I1.MR.dcm"
+                        break # Found Image 1, move to the next series
+                    fi
+                done
+            done
+            break # We found and processed the exam, stop searching the database
+        fi
+    done
+
+    if [ "$exam_found" = false ]; then
+        echo "Error: Exam $exam_num not found in GE database ($ge_db_dir)."
+        return 1
+    fi
+    return 0
+}
+
+# ----------------------------
+
+# 1. Run the native bash extraction function
+if ! extract_images "$examNumber" "$tmp_dir"; then
+    exit 1
+fi
 
 # --- Auto-Detect SAR Mode ---
 first_file=$(ls "$tmp_dir"/E"${examNumber}"S*I1.MR.dcm 2>/dev/null | head -n 1)
@@ -95,22 +203,28 @@ sar_display_text=""
 
 # If --sar-mode was provided, it overrides. Otherwise, try to auto-detect.
 if [ -n "$sar_limit" ]; then
-    sar_display_text="Manual Override ($sar_limit W/kg)"
+    sar_display_text="Manual SAR Limit ($sar_limit W/kg)"
 elif [ -n "$first_file" ] && [ -f "$first_file" ]; then
     
-    # 1. First, check for GE private B1+ RMS limit tag (0043,10DA)
-    auto_b1_limit=$(dcmdump "$first_file" 2>/dev/null | grep -i "0043,10da" | grep -o '\[.*\]' | tr -d '[]')
-    
-    if [ -n "$auto_b1_limit" ]; then
-        display_mode_name="B1+ RMS Mode"
-        assumed_normal=false
-        # Explicitly set the display text since sar_limit will remain empty
-        sar_display_text="Auto-detected $display_mode_name ($auto_b1_limit µT)"
+    # Extract the dynamic limit tags (using cut to safely bypass dcmdump truncation and awk warnings)
+    limit_labels=$(dcmdump "$first_file" 2>/dev/null | grep -i "0043,1090" | awk -F'#' '{print $1}' | cut -d'[' -f2 | tr -d ']')
+    limit_values=$(dcmdump "$first_file" 2>/dev/null | grep -i "0043,1091" | awk -F'#' '{print $1}' | cut -d'[' -f2 | tr -d ']')
+
+    # 1. Check if scanner dynamically generated a custom constraint (Low SAR or B1+rms)
+    if [[ "$limit_labels" == *"LOWSAR_B1PEAK"* ]]; then
+        IFS='\' read -ra val_arr <<< "$limit_values"
+        raw_limit="${val_arr[0]}" # Index 0 holds the enforced Whole Body SAR limit
+        
+        if [ -n "$raw_limit" ]; then
+            # Clean up floating point slop from the GE header (e.g., 0.9999 -> 1.0)
+            sar_limit=$(awk -v val="$raw_limit" 'BEGIN { printf "%.1f", val }')
+            display_mode_name="Low SAR Mode"
+            assumed_normal=false
+            sar_display_text="Auto-detected $display_mode_name ($sar_limit W/kg)"
+        fi
     else
         # 2. Proceed with normal SAR detection
-        scan_options=$(dcmdump "$first_file" 2>/dev/null | grep -i "0018,0022" | grep -o '\[.*\]' | tr -d '[]')
-        operating_mode=$(dcmdump "$first_file" 2>/dev/null | grep -i "0018,9178" | grep -o '\[.*\]' | tr -d '[]')
-        ge_private_mode_raw=$(dcmdump "$first_file" 2>/dev/null | grep -i "0043,1089" | grep -o '\[.*\]' | tr -d '[]')
+        ge_private_mode_raw=$(dcmdump "$first_file" 2>/dev/null | grep -i "0043,1089" | awk -F'#' '{print $1}' | cut -d'[' -f2 | tr -d ']')
 
         # Extract the 3rd element (SAR limit) from the GE private tag to avoid dB/dt false positives
         IFS='\' read -ra ge_priv_arr <<< "$ge_private_mode_raw"
@@ -124,14 +238,10 @@ elif [ -n "$first_file" ] && [ -f "$first_file" ]; then
         detected_mode="UNKNOWN"
         assumed_normal=false
 
-        if [[ "$scan_options" == *"LOW_SAR"* ]]; then
-            detected_mode="LOW_SAR"
-        elif [[ "$ge_sar_mode" == *"FIRST_LEVEL"* ]] || [[ "$scan_options" == *"FIRST_LEVEL"* ]] || [[ "$operating_mode" == *"FIRST_LEVEL"* ]]; then
+        if [[ "$ge_sar_mode" == *"FIRST_LEVEL"* ]]; then
             detected_mode="FIRST_LEVEL"
-        elif [[ "$ge_sar_mode" == *"NORMAL"* ]] || [[ "$scan_options" == *"NORMAL"* ]] || [[ "$operating_mode" == *"NORMAL"* ]]; then
+        elif [[ "$ge_sar_mode" == *"NORMAL"* ]]; then
             detected_mode="NORMAL"
-        elif [[ -n "$operating_mode" ]]; then
-            detected_mode="$operating_mode"
         else
             detected_mode="NORMAL"
             assumed_normal=true
@@ -147,13 +257,6 @@ elif [ -n "$first_file" ] && [ -f "$first_file" ]; then
             "NORMAL")      
                 sar_limit="2.0" 
                 display_mode_name="SAR Normal Mode"
-                ;;
-            "LOW_SAR")
-                display_mode_name="Low SAR"
-                sar_value=$(dcmdump "$first_file" 2>/dev/null | grep -i "0018,1316" | grep -o '\[.*\]' | tr -d '[]')
-                if [ -n "$sar_value" ]; then
-                    sar_limit="$sar_value"
-                fi
                 ;;
         esac
         
@@ -317,31 +420,36 @@ for file in $sorted_files; do
         echo "${series},${clock_time},\"${desc}\",${sar},${sar_time_prod},${duration_us},${time_str},${eff_time_str}" >> "$csv_file"
     fi
 
+    # 4. Check if the user specified a break after this series
+    is_break=false
+    for b in "${break_series[@]}"; do
+        if [ "$series" == "$b" ]; then
+            is_break=true
+            break
+        fi
+    done
+
+    if [ "$is_break" = true ]; then
+        printf "%s\n" "-------------------------------------------------------------------------------------------"
+        print_totals "BREAK"
+        printf "%s\n" "-------------------------------------------------------------------------------------------"
+        
+        # Reset total trackers for the next batch
+        total_time_sec=0
+        total_sar_time=0
+        total_eff_time_sec=0
+    fi
+
 done
 
 # Print the bottom separator for the terminal
 printf "%s\n" "-------------------------------------------------------------------------------------------"
 
-# Calculate total time in MM:SS
-total_mins=$(awk -v sec="$total_time_sec" 'BEGIN { printf "%d", sec / 60 }')
-total_remainder_secs=$(awk -v sec="$total_time_sec" -v min="$total_mins" 'BEGIN { printf "%02.0f", sec - (min * 60) }')
-total_time_str="${total_mins}:${total_remainder_secs}"
+# Print final totals
+print_totals "TOTALS"
+echo ""
 
-# Calculate total effective time in MM:SS (if sar_limit was determined)
-if [ -n "$sar_limit" ]; then
-    total_eff_mins=$(awk -v sec="$total_eff_time_sec" 'BEGIN { printf "%d", sec / 60 }')
-    total_eff_remainder_secs=$(awk -v sec="$total_eff_time_sec" -v min="$total_eff_mins" 'BEGIN { printf "%02.0f", sec - (min * 60) }')
-    total_eff_time_str="${total_eff_mins}:${total_eff_remainder_secs}"
-else
-    total_eff_time_str="N/A"
-fi
-
-# 4. Display the final tally in the terminal
-printf "%-6s   %-5s   %-30s   %-6s | %-8.4f | %-9s | %-8s\n\n" "TOTALS" "" "" "" "$total_sar_time" "$total_time_str" "$total_eff_time_str"
-
-# Append the final tally to the CSV file if the flag was used
 if [ "$export_csv" = true ]; then
-    echo "TOTALS,,,,${total_sar_time},,${total_time_str},${total_eff_time_str}" >> "$csv_file"
     echo "Done! Data successfully exported to: $csv_file"
 fi
 
