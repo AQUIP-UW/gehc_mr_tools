@@ -20,6 +20,7 @@
 # 1.4 - replaced awk with cut for bracket parsing to silence warnings
 # 1.5 - added --break-after flag to reset running totals for implant cooldowns
 # 1.6 - replaced lx_ximg dependency with native bash extraction function
+# 1.7 - significant performance optimizations (dcmdump, awk, globbing)
 
 # DICOM DICT
 SCRIPTDIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
@@ -168,11 +169,8 @@ extract_images() {
                 local series_num=$(dcmdump "$series_img" 2>/dev/null | grep -i "0020,0011" | awk -F'[' '{print $2}' | cut -d']' -f1 | tr -d ' ')
                 
                 # 3. Find Image 1 in this series using GE's filename extension
-                for img_file in "$series_dir"/i*.MRDC.*; do
-                    [ -e "$img_file" ] || continue
-                    local img_num="${img_file##*.MRDC.}" # Bash string manipulation to extract number after .MRDC.
-                    
-                    if [ "$img_num" == "1" ]; then
+                for img_file in "$series_dir"/i*.MRDC.1 "$series_dir"/i*.mrdc.1; do
+                    if [ -e "$img_file" ]; then
                         # Copy and rename to perfectly match the old lx_ximg output format
                         cp "$img_file" "$out_dir/E${exam_num}S${series_num}I1.MR.dcm"
                         break # Found Image 1, move to the next series
@@ -353,9 +351,22 @@ for file in $sorted_files; do
         fi
     fi
 
-    # a. Series Description (Tag 0008,103e)
-    desc=$(dcmdump "$file" | grep -i "0008,103e" | sed -n 's/.*\[\(.*\)\].*/\1/p' | head -n 1)
-    [ -z "$desc" ] && desc="N/A"
+    # Run dcmdump once and parse all required fields simultaneously for performance
+    eval $(dcmdump "$file" 2>/dev/null | awk -F'[][]' '
+      # Series Description (Tag 0008,103e)
+      /0008,103e/ { desc=$2 }
+      # Clock Time (Tag 0008,0031)
+      /0008,0031/ { time=$2 }
+      # Image duration (Tag 0019,105a)
+      /0019,105a/ { match($0, /[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?/); if (RSTART) dur=substr($0, RSTART, RLENGTH) }
+      # SAR Values (Tag 0018,1316)
+      /0018,1316/ { match($0, /[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?/); if (RSTART) sar=substr($0, RSTART, RLENGTH) }
+      END { printf "desc=\"%s\"; time_raw=\"%s\"; duration_us=\"%s\"; sar=\"%s\"\n", desc, time, dur, sar }
+    ')
+    
+    desc=${desc:-"N/A"}
+    [ -z "$duration_us" ] && duration_us=0
+    [ -z "$sar" ] && sar=0
 
     # Check if we need to ignore series starting with "ORIG" or containing "screen save"
     if [ "$ignore_orig" = true ]; then
@@ -365,52 +376,26 @@ for file in $sorted_files; do
         fi
     fi
 
-    # b. Clock Time (Tag 0008,0031)
-    # Extracts the string, removes brackets, and slices the HHMM string into HH:MM
-    time_raw=$(dcmdump "$file" | grep -i "0008,0031" | head -n 1 | awk -F'#' '{print $1}' | awk '{print $NF}' | tr -d '[]')
+    # Format Clock Time
     if [[ ${#time_raw} -ge 4 ]]; then
         clock_time="${time_raw:0:2}:${time_raw:2:2}"
     else
         clock_time="N/A"
     fi
 
-    # c. Image duration (Tag 0019,105a)
-    duration_us=$(dcmdump "$file" | grep -i "0019,105a" | head -n 1 | awk -F'#' '{print $1}' | grep -o -iE '[0-9]*\.?[0-9]+(e[-+]?[0-9]+)?' | tail -n 1)
-    [ -z "$duration_us" ] && duration_us=0
-
-    # Convert microseconds to total seconds
-    dur_sec=$(awk -v us="$duration_us" 'BEGIN { printf "%.2f", us / 1000000 }')
-    
-    # Calculate minutes and remaining seconds for display
-    dur_mins=$(awk -v sec="$dur_sec" 'BEGIN { printf "%d", sec / 60 }')
-    dur_remainder_secs=$(awk -v sec="$dur_sec" -v min="$dur_mins" 'BEGIN { printf "%02.0f", sec - (min * 60) }')
-    time_str="${dur_mins}:${dur_remainder_secs}"
-
-    # d. SAR Values (Tag 0018,1316)
-    sar=$(dcmdump "$file" | grep -i "0018,1316" | head -n 1 | awk -F'#' '{print $1}' | grep -o -iE '[0-9]*\.?[0-9]+(e[-+]?[0-9]+)?' | tail -n 1)
-    [ -z "$sar" ] && sar=0
-
-    # Calculate SAR * duration product (using minutes for the multiplier)
-    sar_time_prod=$(awk -v sar="$sar" -v sec="$dur_sec" 'BEGIN { printf "%.4f", sar * (sec / 60) }')
-
-    # e. Effective Time Calculation (if sar_limit was determined)
-    if [ -n "$sar_limit" ]; then
-        # Calculate effective time in total seconds to easily format to MM:SS
-        eff_sec=$(awk -v prod="$sar_time_prod" -v limit="$sar_limit" 'BEGIN { if(limit>0) printf "%.2f", (prod / limit) * 60; else print "0" }')
-        
-        eff_mins=$(awk -v sec="$eff_sec" 'BEGIN { printf "%d", sec / 60 }')
-        eff_remainder_secs=$(awk -v sec="$eff_sec" -v min="$eff_mins" 'BEGIN { printf "%02.0f", sec - (min * 60) }')
-        eff_time_str="${eff_mins}:${eff_remainder_secs}"
-        
-        # Add to total effective seconds tracking
-        total_eff_time_sec=$(awk -v total="$total_eff_time_sec" -v sec="$eff_sec" 'BEGIN { printf "%.2f", total + sec }')
-    else
-        eff_time_str="N/A"
-    fi
-
-    # Add to totals
-    total_time_sec=$(awk -v total="$total_time_sec" -v sec="$dur_sec" 'BEGIN { printf "%.2f", total + sec }')
-    total_sar_time=$(awk -v total="$total_sar_time" -v prod="$sar_time_prod" 'BEGIN { printf "%.4f", total + prod }')
+    # Perform all mathematical operations and formatting in a single awk block
+    read dur_sec time_str sar_time_prod eff_time_str total_time_sec total_sar_time total_eff_time_sec <<< $(
+      awk -v us="$duration_us" -v sar="$sar" -v lim="${sar_limit:-0}" \
+          -v tt="$total_time_sec" -v ts="$total_sar_time" -v te="$total_eff_time_sec" 'BEGIN {
+        ds = us / 1e6; dm = int(ds / 60); dr = int(ds % 60)
+        sp = sar * (ds / 60)
+        es = (lim > 0) ? (sp / lim) * 60 : 0
+        em = int(es / 60); er = int(es % 60)
+        if (lim > 0)
+            printf "%.2f %d:%02.0f %.4f %d:%02.0f %.2f %.4f %.2f", ds, dm, dr, sp, em, er, tt+ds, ts+sp, te+es
+        else
+            printf "%.2f %d:%02.0f %.4f N/A %.2f %.4f %.2f", ds, dm, dr, sp, tt+ds, ts+sp, te+es
+      }')
 
     # 3. Display the row in the terminal
     printf "%-6s | %-5s | %-30s | %-6.4f | %-8.4f | %-9s | %-8s\n" "$series" "$clock_time" "${desc:0:30}" "$sar" "$sar_time_prod" "$time_str" "$eff_time_str"
@@ -421,15 +406,7 @@ for file in $sorted_files; do
     fi
 
     # 4. Check if the user specified a break after this series
-    is_break=false
-    for b in "${break_series[@]}"; do
-        if [ "$series" == "$b" ]; then
-            is_break=true
-            break
-        fi
-    done
-
-    if [ "$is_break" = true ]; then
+    if [[ " ${break_series[*]} " == *" $series "* ]]; then
         printf "%s\n" "-------------------------------------------------------------------------------------------"
         print_totals "BREAK"
         printf "%s\n" "-------------------------------------------------------------------------------------------"
