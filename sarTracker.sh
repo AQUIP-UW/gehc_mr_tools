@@ -20,6 +20,7 @@
 # 1.4 - replaced awk with cut for bracket parsing to silence warnings
 # 1.5 - added --break-after flag to reset running totals for implant cooldowns
 # 1.6 - replaced lx_ximg dependency with native bash extraction function
+# 1.7 - optimized extract_images function with find and sed to improve performance
 
 # DICOM DICT
 SCRIPTDIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
@@ -148,11 +149,11 @@ extract_images() {
         [ -d "$exam_dir" ] || continue
 
         # Grab the first image of the first series to check the Exam Number
-        local first_img=$(ls "$exam_dir"/*/* 2>/dev/null | grep -iE 'i[0-9]+\.mrdc\.[0-9]+' | head -n 1)
+        local first_img=$(find "$exam_dir" -mindepth 2 -maxdepth 2 -type f -iname 'i*.mrdc.*' -print -quit 2>/dev/null)
         [ -z "$first_img" ] && continue
 
         # Extract (0020,0010) Study ID (Exam Number)
-        local current_exam=$(dcmdump "$first_img" 2>/dev/null | grep -i "0020,0010" | awk -F'[' '{print $2}' | cut -d']' -f1 | tr -d ' ')
+        local current_exam=$(dcmdump +P "0020,0010" "$first_img" 2>/dev/null | sed -n 's/.*\[\(.*\)\].*/\1/p' | tr -d ' ')
 
         if [ "$current_exam" == "$exam_num" ]; then
             exam_found=true
@@ -163,9 +164,9 @@ extract_images() {
                 [ -d "$series_dir" ] || continue
                 
                 # Get the Series Number (0020,0011)
-                local series_img=$(ls "$series_dir"/* 2>/dev/null | grep -iE 'i[0-9]+\.mrdc\.[0-9]+' | head -n 1)
+                local series_img=$(find "$series_dir" -mindepth 1 -maxdepth 1 -type f -iname 'i*.mrdc.*' -print -quit 2>/dev/null)
                 [ -z "$series_img" ] && continue
-                local series_num=$(dcmdump "$series_img" 2>/dev/null | grep -i "0020,0011" | awk -F'[' '{print $2}' | cut -d']' -f1 | tr -d ' ')
+                local series_num=$(dcmdump +P "0020,0011" "$series_img" 2>/dev/null | sed -n 's/.*\[\(.*\)\].*/\1/p' | tr -d ' ')
                 
                 # 3. Find Image 1 in this series using GE's filename extension
                 for img_file in "$series_dir"/i*.MRDC.*; do
